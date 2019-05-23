@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+import subprocess as sp
+import time,datetime
+import logging
+import random
+
+LOGLEVEL = os.getenv("RBLOGLEVEL",logging.DEBUG)
+DEBUG = bool(os.getenv("RBDEBUG", "notset") != "notset")
+CFG = os.path.join(os.path.dirname(sys.argv[0]),os.pardir,"config")
+
+# Runtime platform - i.e., "GKE" or "local"
+PLATFORM = os.getenv("RBPLATFORM", "local")
+GKE_PLATFORM = "GKE"
+GCR="gcr.io"
+GKE_PROJECT_ID = "UNKNOWN_GKE_PROJECT"
+
+# deployment yaml customization
+DEPLOYMENT_TEMPLATE = os.path.join(CFG,'runbox-deployment.yml.template')
+ENVNAME_PLACEHOLDER   = '__ENVNAME__'
+ROLE_PLACEHOLDER      = '__ROLE__'
+REPLICAS_PLACEHOLDER  = '__REPLICAS__'
+IMAGE_PLACEHOLDER     = '__IMAGE__'
+RBUTILIMAGE_PLACEHOLDER = '__RBUTILIMAGE__'
+NFS_ADDR_PLACEHOLDER  = '__NFS_ADDR__'
+RUNBOX_KEY="runbox.env"
+RUNBOX_ROLE="runbox.role"
+WORKER="worker"
+SIDECAR_CONTAINER="rbutil"
+NFS_SERVER="nfs-server"
+ROLE="role"
+RUNBOX_AUX = "runbox-aux"
+RUNBOX_NS = "runbox"
+ENV_NS = "default"
+
+NFS_SERVER_YAML = os.path.join(CFG,"nfs-service.yaml")
+
+GET_POD_RETRIES=300
+GET_POD_RETRIES_DELAY=0.1
+RUNBOX_ERROR_RC=11
+
+RUNBOX_COMMENT_SUFFIX="[__RUNBOX__]"
+
+SESSION_ID=random.randint(0, 100)
+
+logger = logging.getLogger(__name__)
+
+def _init_logger(level):
+    global logger
+    logger.setLevel(LOGLEVEL)
+    fh = logging.FileHandler('/tmp/runbox.log')
+    fh.setLevel(LOGLEVEL)
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    ff = logging.Formatter('%(asctime)s - %(levelname)s - [' + str(SESSION_ID) + '] - %(message)s')
+    cf = logging.Formatter('%(asctime)s %(message)s')
+    fh.setFormatter(ff)
+    ch.setFormatter(cf)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+def _shorten(cmd):
+    if len(cmd)>200:
+        cmd = cmd[:80] + " [...] " + cmd[-120:]
+    return cmd
+
+# Run the given shell command (list of strings) and return the output
+def sh(cmds,live=False,strip=True,binary=False,pass_stdin=True):
+    logger.debug("Running: " + _shorten(" ".join(cmds)))
+    inp = None
+    if not pass_stdin:
+        inp = sp.DEVNULL
+    process = sp.Popen(cmds, stdin=inp, stdout=sp.PIPE, stderr=sp.PIPE, bufsize=0)
+    out=""
+    while True:
+        if not binary:
+            output = process.stdout.readline().decode()
+        else:
+            output = process.stdout.read(1)
+        if len(output) == 0 and process.poll() is not None:
+            break
+        if not binary:
+            out = out + output
+            if len(output) > 0:
+                logger.debug(output)
+        if live:
+            sys.stdout.buffer.write(output)
+            sys.stdout.buffer.flush()
+    err = process.stderr.read().decode()
+    if strip:
+        out = out.strip()
+        err = err.strip()
+    if len(err) > 0:
+        logger.info("ERR:\n"+err)
+
+    return process.returncode,out,err
+
+# Execute the given command within the container and return the output
+def kexec(env,cmd,container=WORKER,live=True,pass_stdin=False,binary=False,ns=ENV_NS):
+    pod,err = get_pod(env,ns=ns)
+    if pod is not None:
+        logger.info("Running command \"{}\" in Pod {}".format(_shorten(cmd),pod))
+        rc,out,err = sh(["kubectl","exec",pod,"-i","-c",container,"-n",ns,"--","sh","-c"] + [cmd], live=live, strip=not live, pass_stdin=pass_stdin, binary=binary)
+        # if rc!=0, k8s appends to stderr "command terminated with exit code XX" - remove
+        if rc!=0:
+            newln = err.endswith('\n')
+            err = '\n'.join(err.splitlines()[:-1])
+            if newln:
+                err = err + '\n'
+        return rc,out,err
+    else:
+        return RUNBOX_ERROR_RC,"",err
+
+# Run a given kubectl command, return stdout and stderr
+def kubectl(cmd,ns=ENV_NS):
+    rc,out,err = sh(["bash","-c"," ".join(["kubectl","-n",ns,cmd])])
+    return out,err
+
+def kubectl_create(filename,ns=ENV_NS):
+    rc,out,err = sh(["bash","-c"," ".join(["cat",filename,"|","kubectl","-n",ns,"create", "-f", "-"])])
+    return out,err
+
+def kubectl_delete(filename,ns=ENV_NS):
+    rc,out,err = sh(["bash","-c"," ".join(["cat",filename,"|","kubectl","-n",ns,"delete", "-f", "-"])])
+    os.remove(filename)
+    return out,err
+
+def gcloud(cmd):
+    rc,out,err = sh(["bash", "-c", " ".join(["gcloud", "-q", cmd])])
+    return out, err
+
+def _get_pod(label_key, label_value, num_containers, retries=GET_POD_RETRIES, ns=ENV_NS):
+    cnt=0
+    cmd = "get pods -l {}={} -o json | jq -r '.items[0] ".format(label_key, label_value)
+    for i in range(num_containers):
+        cmd += "| select(.status.containerStatuses[{}].ready==true) ".format(i)
+    cmd += "| .metadata.name'"
+    while cnt<retries:
+        pod,err = kubectl(cmd,ns=ns)
+        if len(pod)>0 and pod != "null" and len(err)==0:
+            break
+        if cnt % 15 == 0:
+            logger.info("Waiting for the Pod to become available")
+        time.sleep(GET_POD_RETRIES_DELAY)
+        cnt+=1
+    if cnt>=retries:
+        return None,"Could not find active Pod with %s=%s" % (label_key, label_value)
+    else:
+        return pod,""
+
+POD=None # Current Pod. Notice that the script always works with only one env.
+
+def get_pod(env, retries=GET_POD_RETRIES, ns=ENV_NS):
+    global POD
+    if POD is not None: # already retreived earlier, return cached
+        return POD, ""
+    pod,err =  _get_pod(label_key=RUNBOX_KEY, label_value=env, num_containers=2, retries=retries, ns=ns)
+    if pod is not None and (err is None or len(err) == 0):
+        POD = pod # pod found, update cache
+    return pod,err
+
+def get_worker(env,imagetag):
+    return kubectl("get pods -l %s=%s -o json |"\
+               " jq -r '.items[0].status.containerStatuses[] |"\
+                        " select(.name==\"%s\") | .containerID' | cut -c 10-" % (RUNBOX_KEY,env,WORKER))
+
+def kscale(env,num):
+    out,err = kubectl("scale --replicas {} deployment/{}".format(num,env))
+    return err
+
+def scale_to_1(env):
+    # check if Pod is already running, to avoid scaling operation (which is typically more expensive)
+    pod,err = get_pod(env, retries=1)
+    if pod is None:
+        return kscale(env,1)
+    else:
+        return err # likely empty
+
+def scale_to_0(env):
+    return kscale(env,0)
+
+def sync_data(envname, local_path, remote_path):
+    BASE_DIR = os.path.join(os.path.dirname(sys.argv[0]),os.pardir)
+    if local_path == "":
+        local_path = os.path.join(BASE_DIR, "data") #TODO: more reasonable default? cwd?
+    local_path = os.path.abspath(local_path)
+    remote_path = "//data" + remote_path
+    kexuni_path = os.path.join(BASE_DIR,"bin","kexuni")
+    logger.debug("Local path to synchronize: " + local_path)
+    logger.debug("Remote path to synchronize: " + remote_path)
+    # make sure destination directory exists
+    parent_path = os.path.dirname(local_path)
+    kexec(env=envname, cmd="mkdir -p " + remote_path, live=False)
+    kexec(env=envname, cmd="mkdir -p " + parent_path, live=False)
+    kexec(env=envname, cmd="ln -sfn " + remote_path + " " + local_path, live=False)
+    unisoncmd=["unison","-force","newer",local_path,"rsh://"+envname+remote_path,"-rshcmd",kexuni_path,"-batch", "-ignore", "Path .unison"]
+    if DEBUG:
+        unisoncmd += ["-debug","all"]
+    # TODO: when using sh(), it gets stuck when there are lots of files (buffering deadlock?)
+    res = sp.Popen(unisoncmd,stdin=sp.DEVNULL,stdout=sp.PIPE,stderr=sp.STDOUT).stdout.read().decode()
+    logger.debug(res)
+
+def get_image_repo():
+    if PLATFORM == GKE_PLATFORM:
+        return '%s/%s/' % (GCR,GKE_PROJECT_ID)
+    else: # local
+        return ""
+
+def get_tag(env):
+    if PLATFORM == GKE_PLATFORM:
+        return GCR + '/%s/%s' % (GKE_PROJECT_ID, env)
+    else: # local
+        return env + ':latest'
+
+def docker(env, cmd, ns=ENV_NS):
+    # we use the sidecar container to run docker commands
+    rc,out,err=kexec(env, cmd="docker " + cmd, container=SIDECAR_CONTAINER, live=False, ns=ns)
+    # TODO: return err separately
+    return out+err
+
+def dockeraux(cmd):
+    return docker(env=RUNBOX_AUX, cmd=cmd, ns=RUNBOX_NS)
+
+def run(env, cmd, kill_after=False, sync_before=False, sync_after=False, local_path="", remote_path=""):
+    logger.info("Scaling " + env + " to 1 (if needed)")
+    err=scale_to_1(env)
+    if len(err) > 0:
+        return 1,"Error scaling environment %s" % env, err
+    if sync_before:
+        logger.info("Synchronizing data folder with " + env)
+        sync_data(env, local_path, remote_path)
+    if cmd == "true":
+        logger.info("Command is 'true', no need to run anything")
+        # if command is "true", we assume that there is no need to actually run it
+        # this is a useful (?) hack 
+        res = 0,"",""
+    else:
+        logger.info("Running command in " + env)
+        res = kexec(env,cmd,pass_stdin=True,binary=True)
+        logger.info("Execute complete")
+    if sync_after:
+        logger.info("Synchronizing data folder with " + env)
+        sync_data(env, local_path, remote_path)
+    if kill_after:
+        # take snapshot, update the same image tag
+        imagetag = get_tag(env)
+        c,err = get_worker(env,imagetag)
+        if c is None or len(c) == 0 or len(err)>0:
+            logger.error("Error taking snapshot")
+            logger.error(err)
+        logger.info("Taking snapshot of {}, reapply tag {}".format(c,imagetag))
+        # the special suffix in commit message will be used to squash commits
+        commit=docker(env=env, cmd="commit -m \'%s %s\' %s" % (cmd[:80],RUNBOX_COMMENT_SUFFIX,c))
+        img=commit[commit.find(':')+1:]
+        docker(env=env, cmd="tag %s %s" % (img,imagetag))
+        if PLATFORM != 'local':
+            auth_docker_in_sidecar(env)
+            docker(env, cmd="push %s" % imagetag)
+        logger.info("Scaling " + env + " to 0")
+        scale_to_0(env)
+    return res
+
+def list_environments():
+    out,err = kubectl("get deployment -l %s=%s -o json | jq -r '.items[].metadata.name'" % (RUNBOX_ROLE,WORKER))
+    print(out)
+    if len(err.strip())>0:
+        logger.error(err)
+
+def create_yaml(envname, role=WORKER, replicas=1, image="ubuntu", nfs_addr="localhost"):
+    template = DEPLOYMENT_TEMPLATE
+    suffix = "deployment"
+    fname = os.path.join(CFG, "%s-%s.yml.tmp" % (envname,suffix))
+    rbutil_image = "%s%s" % (get_image_repo(),"rbutil")
+    logger.debug("CREATE " + fname)
+    with open(template,"r") as tmpl, open(fname,"w") as yaml:
+        yaml.write(tmpl.read().replace(ENVNAME_PLACEHOLDER,envname)\
+                              .replace(ROLE_PLACEHOLDER, role)\
+                              .replace(REPLICAS_PLACEHOLDER, str(replicas))\
+                              .replace(IMAGE_PLACEHOLDER,image)\
+                              .replace(RBUTILIMAGE_PLACEHOLDER,rbutil_image)\
+                              .replace(NFS_ADDR_PLACEHOLDER, nfs_addr))
+    return fname
+
+def report_usage(env,delta):
+    deltams = delta.seconds * 1000 + delta.microseconds / 1000
+    # delta in seconds, with 100ms granularity
+    deltasec = int((deltams + 99) / 100) / 10
+    # retrieve resource allocation
+    cpu,_ = kubectl("get pods -l %s=%s -o json | jq -r '.items[0].spec.containers[] | select(.name==\"%s\") | .resources.requests.cpu'" % (RUNBOX_KEY,env,WORKER))
+    mem,_ = kubectl("get pods -l %s=%s -o json | jq -r '.items[0].spec.containers[] | select(.name==\"%s\") | .resources.requests.memory'" % (RUNBOX_KEY,env,WORKER))
+    cpu = int(cpu[:cpu.find('m')])
+    mem = int(mem[:mem.find('M')])
+    # usage "unit" = 100ms execution using 1/8 core and 1/8 GB of memory
+    units = deltasec * cpu * mem * 10 / 128 / 128
+    print("Capacity used: %.1f units (%d ms)" % (units,deltams))
+
+def error_exit(err,msg):
+    logger.error(err)
+    logger.error(msg)
+    sys.exit(1)
+
+def alloc(env,allocation):
+    # 1 allocation unit is 128m cpu (1/8 core) and 128Mi of memory (1/8 GB)
+    cpu = str(128*float(allocation))+"m"
+    mem = str(128*float(allocation))+"Mi"
+    patch = '{"spec":{"template":{"spec":{"containers":[{"name":"%s","resources":'\
+            '{"requests":{"cpu":"%s","memory":"%s"},"limits":{"cpu":"%s","memory":"%s"}}}]}}}}'\
+            % (WORKER,cpu,mem,cpu,mem)
+    return kubectl("patch deployment %s --patch='%s'" % (env,patch))
+
+def squash(env):
+    img = get_tag(env)
+    # exclude images with "runbox" comment
+    last_img = docker(env=env, cmd="history --format \"{{.ID}} {{.Comment}}\" %s"\
+                   " | grep -v missing | grep -v \"%s\" | head -1 | awk '{print $1}'"\
+                   % (img,RUNBOX_COMMENT_SUFFIX))
+    # TODO: this is not working because of a bug in docker (?)
+    #       that causes images IDs to disappear from history
+    #       https://github.com/goldmann/docker-squash/issues/177
+    if len(last_img)==0: # no runbox layers, nothing to squash
+        return None
+    res = kexec(env=env, cmd="docker-squash -f %s -t %s -m \"Squashed %s\" %s" % (last_img,img,RUNBOX_COMMENT_SUFFIX,img), container=SIDECAR_CONTAINER, live=False)[1]
+    #TODO: parse & return the number of squashed layers
+    return 1
+
+def launch_runbox_aux():
+    #TODO: check existence before creating
+    nfs_addr = nfs_server_addr()
+    create_nfs(RUNBOX_AUX)
+    filename = create_yaml(RUNBOX_AUX, role='aux', image='alpine', replicas=1, nfs_addr=nfs_addr)
+    _,err = kubectl_create(filename,ns=RUNBOX_NS)
+    #if len(err)>0:
+    #        error_exit(err, "Could not create runbox AUX deployment")
+
+def terminate_runbox_aux():
+    kubectl("delete deployment %s" % RUNBOX_AUX, ns=RUNBOX_NS)
+    delete_nfs(RUNBOX_AUX)
+
+def auth_docker_in_sidecar(env, container=SIDECAR_CONTAINER, ns=ENV_NS):
+    if PLATFORM == "local":
+        return
+    pod,err = get_pod(env, ns=ns)
+    if pod is not None:
+        logger.info("Running command \"docker login\" in Pod {}".format(pod))
+        if PLATFORM == GKE_PLATFORM:
+            # TODO: use 'gcloud' and 'kubectl' functions
+            token = sp.Popen(["gcloud","auth","print-access-token"],stdout=sp.PIPE)
+            res = sp.Popen(["kubectl","exec",pod,"-i","-c",container,"-n",ns,"--","sh","-c","read token && docker login -u oauth2accesstoken -p \"$token\" https://gcr.io"],stdin=token.stdout,stdout=sp.PIPE,stderr=sp.STDOUT).stdout.read().decode()
+            logger.debug(res)
+        # if local, no need for auth
+
+def auth_docker_aux():
+    return auth_docker_in_sidecar(env=RUNBOX_AUX, ns=RUNBOX_NS)
+
+def nfs_server_addr():
+    nfs_addr = None
+    # check whether NFS server is deployed (do not wait if it isn't)
+    pod,err = _get_pod(ROLE, NFS_SERVER, num_containers=1, retries=1, ns=RUNBOX_NS)
+    if pod is None or err is None or len(err)>0:
+        # try starting NFS server
+        # TODO eventually this should be part of the initialization/setup logic, ant not here 
+        _,err = kubectl_create(NFS_SERVER_YAML,ns=RUNBOX_NS)
+        if len(err)>0:
+            error_exit(err, "Could not deploy NFS server")
+        pod = _get_pod(ROLE, NFS_SERVER, num_containers=1, ns=RUNBOX_NS)
+    if pod is not None:
+        nfs_addr, _ = kubectl("get services nfs-server -o json | jq -r '.spec.clusterIP'", ns=RUNBOX_NS)
+    return nfs_addr
+
+def config_platform():
+    logger.info("Platform: %s" % PLATFORM)
+    if PLATFORM == GKE_PLATFORM:
+        global GKE_PROJECT_ID
+        GKE_PROJECT_ID, _ = gcloud("config list 2>&1 | grep -Po 'project = \K.*'")
+        logger.info("project id %s" % GKE_PROJECT_ID)
+
+# create a tagged image pointing to the given image; pull/push as needed
+def tag_image(image, tag):
+    # launch auxilary runbox deployment
+    launch_runbox_aux()
+    if PLATFORM != "local":
+        auth_docker_aux()
+    if len(dockeraux("images -q %s" % image).strip()) == 0:
+        res = dockeraux("pull %s" % image)
+        # TODO: return error separately
+        if "Error" in res:
+            error_exit(res, "Could not create environment")
+    # tag provided docker image with the environment name
+    res = dockeraux("tag %s %s" % (image,tag))
+    if "Error" in res:
+        error_exit(res, "Could not create environment")
+    # push to registry if needed
+    if PLATFORM != "local":
+        logger.info("push %s" % tag)
+        dockeraux("push %s" % tag)
+    # TODO: need to terminate also in case of errors
+    terminate_runbox_aux()
+
+def create_nfs(env):
+    pod,err = _get_pod(ROLE, NFS_SERVER, num_containers=1, retries=1, ns=RUNBOX_NS)
+    if pod is None or (err is not None and len(err)>0):
+        error_exit(err, "Could not allocate NFS storage")
+    sh(["kubectl","exec",pod,"-i","-n",RUNBOX_NS,"--","mkdir","/exports/%s" % (env)])
+
+def delete_nfs(env):
+    pod,err = _get_pod(ROLE, NFS_SERVER, num_containers=1, retries=1, ns=RUNBOX_NS)
+    if pod is None or (err is not None and len(err)>0):
+        error_exit(err, "Could not allocate NFS storage")
+    sh(["kubectl","exec",pod,"-i","-n",RUNBOX_NS,"--","rm","-rf","/exports/%s" % (env)])
+
+# MAIN
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Serverless VM on Kubernetes')
+    parser.add_argument('--verbose', '-v', default=0, action='count')
+
+    envcommands = parser.add_mutually_exclusive_group()
+    envcommands.add_argument('-l', '--list', help='list available environments', action='store_true')
+    envcommands.add_argument('-c', '--create', help='create environment', metavar="ENV_NAME")
+    envcommands.add_argument('-d', '--delete', help='delete environment', metavar="ENV_NAME")
+    envcommands.add_argument('-m', '--merge', help='[DOES NOT WORK!] merge (squash) image commits for an environment', metavar="ENV_NAME")
+    envcommands.add_argument('environment', nargs='?', help='run command in an environment')
+
+    parser.add_argument('-i', '--image', help='specify Docker image when creating an environment', metavar="IMAGE", default="ubuntu:18.10")
+    parser.add_argument('-s', '--sync', help='synchronize data folder before and after executing command', action='store_true')
+    parser.add_argument('-B', '--sync_before', help='synchronize data folder before executing command', action='store_true')
+    parser.add_argument('-A', '--sync_after', help='synchronize data folder after executing command', action='store_true')
+    parser.add_argument('-L', '--localpath', help='specify the local directory to be synchronized ', metavar="LOCAL_PATH", default="")
+    parser.add_argument('-R', '--remotepath', help='specify the remote directory to be synchronized ', metavar="REMOTE_PATH", default="")
+    parser.add_argument('-u', '--usage', help='report capacity usage', action='store_true')
+    parser.add_argument('-a', '--allocate', help='specify resource allocation (in units of 1/8 core + 128mb) when running a command', metavar="allocation")
+    parser.add_argument('-k', '--kill_after', help='kill the Pod after the command is over', action='store_true')
+    parser.add_argument('command', help='command', nargs=argparse.REMAINDER)
+
+    args = parser.parse_args()
+
+    if args.verbose > 2:
+        DEBUG=True
+    level = logging.ERROR
+    if args.verbose > 0:
+        level = logging.INFO
+    if DEBUG:
+        level = logging.DEBUG
+    _init_logger(level)
+    logger.debug(args)
+
+    config_platform()
+
+    if args.list:
+        list_environments()
+    elif args.create:
+        env = args.create
+        logger.info("Creating new environment " + env)
+        # create a tagged image, push to remote registry if needed
+        imagetag=get_tag(env)
+        tag_image(args.image, imagetag)
+        # retrieve NFS server address
+        nfs_addr = nfs_server_addr()
+        # create NFS folder
+        create_nfs(env)
+        # create k8s deployment
+        filename=create_yaml(env, image=imagetag, nfs_addr=nfs_addr)
+        _,err = kubectl_create(filename)
+        if len(err)>0:
+            error_exit(err, "Could not create environment")
+        logger.info("Environment " + env + " created")
+    elif args.delete:
+        env = args.delete
+        imagetag=get_tag(env)
+        filename=create_yaml(env, image=imagetag)
+        kubectl_delete(filename)
+        # delete NFS folder
+        delete_nfs(env)
+        # TODO: recycle unused images on hosts ('docker rmi imagetag')
+        # TODO: remove image from registry (need to use registry APIs, e.g. gcloud)
+        print("Environment " + env + " removed")
+    elif args.merge:
+        env = args.merge
+        res = squash(env=env)
+        if res:
+            print("Finished squashing image for %s (%d layers squashed)" % (env,int(res)))
+        else:
+            print("No runbox layers to squash or unknown ID of the last non-RUNBOX image")
+    elif args.environment and len(args.command) > 0:
+        # RUN COMMAND
+        env = args.environment
+        allocation = args.allocate
+        if allocation:
+            logger.info("Adjusting resource allocation to %s" % allocation)
+            _,err = alloc(env,allocation)
+            if len(err)>0:
+                error_exit(err, "Could not change resource allocation")
+        start = datetime.datetime.now()
+        rc,out,err = run(env, " ".join(args.command), kill_after=args.kill_after,
+                         sync_before=(args.sync or args.sync_before),
+                         sync_after=(args.sync or args.sync_after),
+                         local_path=args.localpath, remote_path=args.remotepath)
+        finish = datetime.datetime.now()
+        if rc==RUNBOX_ERROR_RC:
+            error_exit(err, "Could not run command")
+        # forward rc/err back from command execution
+        sys.stderr.write(err)
+        sys.stderr.flush()
+        # show usage
+        if args.usage:
+            report_usage(env,finish - start)
+        sys.exit(rc)
+    else:
+        print("Must provide environment name and command to run")
+

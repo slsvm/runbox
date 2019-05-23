@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __ENVNAME__
+  labels:
+    runbox.role: __ROLE__
+spec:
+  replicas: __REPLICAS__
+  selector:
+    matchLabels:
+      runbox.env: __ENVNAME__
+  template:
+    metadata:
+      labels:
+        runbox.env: __ENVNAME__
+        runbox.role: __ROLE__
+    spec:
+      hostname: __ENVNAME__
+      containers:
+      - name: worker
+        image: __IMAGE__
+        imagePullPolicy: IfNotPresent 
+        command: ["sh", "-c", "while true ; do sleep 2 ; echo -n .; done"]
+        resources:
+          requests:
+            cpu: "128m"
+            memory: "128Mi"
+          limits:
+            cpu: "128m"
+            memory: "128Mi"
+        volumeMounts:
+        - mountPath: /data
+          name: __ENVNAME__-volume
+      - name: rbutil
+        image: __RBUTILIMAGE__
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "while true ; do sleep 3 ; echo -n .; done"]
+        volumeMounts:
+        - mountPath: /data
+          name: __ENVNAME__-volume
+        - mountPath: "/var/run/docker.sock"
+          name: dockersock
+      volumes:
+      - name: __ENVNAME__-volume
+        nfs:
+          server: __NFS_ADDR__
+          path: "/__ENVNAME__"
+      - name: dockersock
+        hostPath:
+          path: /var/run/docker.sock
+      terminationGracePeriodSeconds: 1
